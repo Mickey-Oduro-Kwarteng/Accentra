@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { Bell, ChevronDown, LogOut, Menu, Settings } from 'lucide-vue-next'
 import NotificationPanel from './NotificationPanel.vue'
 import { useNotifications } from '../../composables/useNotifications'
+import { useProfile } from '../../composables/useProfile'
 
 const props = defineProps({
   email: { type: String, default: '' },
@@ -16,16 +17,24 @@ const bellOpen = ref(false)
 const bellRoot = ref(null)
 
 const { unreadCount, refresh, ensureLoaded } = useNotifications()
+const { profile } = useProfile()
 
-// Derive a display name and initials from the email until we store profiles.
+// The email is the fallback, not the source: it is all we have before the
+// profile row arrives, and all we have if someone never filled their name in.
 const handle = computed(() => props.email.split('@')[0] || 'there')
-const displayName = computed(() =>
+const nameFromEmail = computed(() =>
   handle.value
     .split(/[._-]/)
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(' '),
 )
+
+const displayName = computed(
+  () => profile.value?.fullName?.trim() || nameFromEmail.value,
+)
+const avatarUrl = computed(() => profile.value?.avatarUrl || '')
+
 const initials = computed(
   () =>
     displayName.value
@@ -112,7 +121,14 @@ onBeforeUnmount(() => {
           aria-haspopup="menu"
           @click="menuOpen = !menuOpen; bellOpen = false"
         >
+          <img
+            v-if="avatarUrl"
+            :src="avatarUrl"
+            alt=""
+            class="size-9 shrink-0 rounded-lg object-cover"
+          />
           <span
+            v-else
             class="grid size-9 place-items-center rounded-lg bg-linear-to-br from-brand-500 to-brand-700 text-xs font-semibold text-white"
           >
             {{ initials }}
@@ -129,9 +145,17 @@ onBeforeUnmount(() => {
           role="menu"
           class="absolute right-0 mt-2 w-60 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-card"
         >
-          <div class="border-b border-slate-100 px-4 py-3">
-            <p class="text-sm font-medium text-ink">{{ displayName }}</p>
-            <p class="truncate text-xs text-slate-400">{{ email }}</p>
+          <div class="flex items-center gap-3 border-b border-slate-100 px-4 py-3">
+            <img
+              v-if="avatarUrl"
+              :src="avatarUrl"
+              alt=""
+              class="size-9 shrink-0 rounded-lg object-cover"
+            />
+            <div class="min-w-0">
+              <p class="truncate text-sm font-medium text-ink">{{ displayName }}</p>
+              <p class="truncate text-xs text-slate-400">{{ email }}</p>
+            </div>
           </div>
           <RouterLink
             to="/portal/settings"

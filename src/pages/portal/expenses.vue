@@ -1,7 +1,16 @@
 <script setup>
 import { computed, ref } from 'vue'
-import { CalendarClock, ChartColumn, Plus, Receipt, Upload, Users } from 'lucide-vue-next'
+import {
+  CalendarClock,
+  ChartColumn,
+  Ellipsis,
+  Plus,
+  Receipt,
+  Upload,
+  Users,
+} from 'lucide-vue-next'
 import StatCard from '../../components/dashboard/StatCard.vue'
+import ExpenseActionsModal from '../../components/modals/ExpenseActionsModal.vue'
 import RecordExpenseModal from '../../components/modals/RecordExpenseModal.vue'
 import UploadReceiptModal from '../../components/modals/UploadReceiptModal.vue'
 import AsyncState from '../../components/portal/AsyncState.vue'
@@ -83,11 +92,19 @@ const statCards = computed(() => {
 
 const showRecordExpense = ref(false)
 const showUploadReceipt = ref(false)
+const actionsFor = ref(null)
+const showActions = ref(false)
+
+function openActions(expense) {
+  actionsFor.value = expense
+  showActions.value = true
+}
 
 /**
  * A new claim moves the pending figure and the transaction count, and — once
  * approved — the category meters, so all three refetch rather than only the
- * table the row landed in.
+ * table the row landed in. An edit, a decision or a deletion can move the same
+ * three, so they all land here.
  */
 function refreshAll() {
   refreshStats()
@@ -122,6 +139,12 @@ function refreshAll() {
 
     <RecordExpenseModal v-model:open="showRecordExpense" @created="refreshAll" />
     <UploadReceiptModal v-model:open="showUploadReceipt" @uploaded="refreshRows" />
+
+    <ExpenseActionsModal
+      v-model:open="showActions"
+      :expense="actionsFor"
+      @changed="refreshAll"
+    />
 
     <AsyncState
       class="mt-7 block"
@@ -181,7 +204,7 @@ function refreshAll() {
 
         <AsyncState :loading="rowsLoading" :error="rowsError" @retry="refreshRows">
           <template #skeleton>
-            <TableSkeleton :rows="8" :columns="5" :avatar="false" />
+            <TableSkeleton :rows="8" :columns="5" :avatar="false" actions />
           </template>
 
           <div class="overflow-x-auto">
@@ -193,6 +216,7 @@ function refreshAll() {
                   <th scope="col" class="px-6 py-3 font-medium">Date</th>
                   <th scope="col" class="px-6 py-3 font-medium">Status</th>
                   <th scope="col" class="px-6 py-3 text-right font-medium">Amount</th>
+                  <th scope="col" class="px-6 py-3"><span class="sr-only">Actions</span></th>
                 </tr>
               </thead>
               <tbody>
@@ -216,10 +240,20 @@ function refreshAll() {
                   <td class="px-6 py-4 text-right text-sm font-semibold whitespace-nowrap text-ink tabular-nums">
                     {{ expense.amount }}
                   </td>
+                  <td class="px-6 py-4 text-right">
+                    <button
+                      type="button"
+                      class="grid size-8 place-items-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-ink"
+                      :aria-label="`Actions for ${expense.vendor}`"
+                      @click="openActions(expense)"
+                    >
+                      <Ellipsis class="size-4" />
+                    </button>
+                  </td>
                 </tr>
 
                 <tr v-if="!rows?.length">
-                  <td colspan="5" class="px-6 py-14 text-center">
+                  <td colspan="6" class="px-6 py-14 text-center">
                     <p class="text-sm font-medium text-ink">No expenses to show</p>
                     <p class="mt-1 text-sm text-slate-500">
                       Try a different status, or record your first expense.

@@ -249,6 +249,13 @@ export async function createTransaction(organizationId, transaction) {
   )
 }
 
+export async function deleteTransaction(transactionId) {
+  return unwrap(
+    await supabase.from('transactions').delete().eq('id', transactionId),
+    'transaction delete',
+  )
+}
+
 /**
  * Live feed. Realtime respects RLS, so this only ever delivers rows the caller
  * may already read — but the table must be added to the publication first:

@@ -12,6 +12,7 @@ const TONES = {
   Approved: 'bg-emerald-50 text-emerald-700',
   Cleared: 'bg-emerald-50 text-emerald-700',
   Active: 'bg-emerald-50 text-emerald-700',
+  Reimbursed: 'bg-emerald-50 text-emerald-700',
   Sent: 'bg-brand-50 text-brand-700',
   Pending: 'bg-amber-50 text-amber-700',
   Onboarding: 'bg-amber-50 text-amber-700',
@@ -19,7 +20,9 @@ const TONES = {
   'Needs review': 'bg-amber-50 text-amber-700',
   Overdue: 'bg-red-50 text-red-600',
   Failed: 'bg-red-50 text-red-600',
+  Rejected: 'bg-red-50 text-red-600',
   Draft: 'bg-slate-100 text-slate-600',
+  Cancelled: 'bg-slate-100 text-slate-500 line-through',
 }
 
 const tone = computed(() => TONES[props.status] ?? 'bg-slate-100 text-slate-600')

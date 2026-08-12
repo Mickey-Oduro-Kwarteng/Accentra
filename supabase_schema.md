@@ -245,6 +245,11 @@ create table public.invoices (
   sent_at         timestamptz,
   paid_at         timestamptz,
 
+  -- How the client is asked to pay, chosen when the invoice is raised, and
+  -- overwritten with how they actually paid when the payment is recorded.
+  -- Nullable because plenty of invoices simply do not say.
+  payment_method  payment_method,
+
   created_by      uuid references auth.users(id) on delete set null,
   created_at      timestamptz not null default now(),
   updated_at      timestamptz not null default now(),
@@ -257,6 +262,20 @@ create table public.invoices (
 create index invoices_org_status_idx on public.invoices(organization_id, status);
 create index invoices_due_idx        on public.invoices(organization_id, due_date);
 create index invoices_client_idx     on public.invoices(client_id);
+```
+
+**Already have a database built from an earlier copy of this file?** The
+`payment_method` column is new. Without it the invoice form fails with *"Could
+not find the 'payment_method' column of 'invoices' in the schema cache"*. Add
+it — the column is nullable, so every existing invoice stays valid and simply
+reads as "not specified":
+
+```sql
+alter table public.invoices
+  add column if not exists payment_method payment_method;
+
+-- PostgREST caches the column list; tell it to look again.
+notify pgrst, 'reload schema';
 ```
 
 ### 3.7 `invoice_items`

@@ -2,6 +2,9 @@
 import { nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { X } from 'lucide-vue-next'
 
+// Module-level: shared by every dialog, because they share one page behind them.
+let openDialogs = 0
+
 /**
  * The dialog every modal in this folder is built on.
  *
@@ -31,6 +34,24 @@ const WIDTHS = {
 const id = useId()
 const panel = ref(null)
 let lastFocused = null
+
+/**
+ * How many dialogs are open, across every instance.
+ *
+ * Dialogs nest — a row's actions list opens an edit form on top of itself — and
+ * they all share one body. A flag would let the inner one closing unlock the
+ * page behind the outer one, leaving the backdrop scrolling. `locked` is
+ * per-instance so the count only ever moves on a real change, which keeps an
+ * unmount of a dialog that was never opened from decrementing someone else's.
+ */
+let locked = false
+
+function lockScroll(next) {
+  if (next === locked) return
+  locked = next
+  openDialogs = Math.max(0, openDialogs + (next ? 1 : -1))
+  document.body.style.overflow = openDialogs > 0 ? 'hidden' : ''
+}
 
 function close() {
   if (props.busy) return
@@ -62,10 +83,6 @@ function onKeydown(event) {
     event.preventDefault()
     first.focus()
   }
-}
-
-function lockScroll(locked) {
-  document.body.style.overflow = locked ? 'hidden' : ''
 }
 
 watch(open, async (isOpen) => {

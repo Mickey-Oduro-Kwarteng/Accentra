@@ -14,20 +14,33 @@ import {
   PAYMENT_METHODS,
   createExpense,
   createExpenseWithPayment,
+  getExpense,
   listExpenseCategories,
+  updateExpense,
   uploadReceipt,
 } from '../../services/expenseService'
 import { canWrite } from '../../services/organizationService'
 
 /**
- * Files a claim against `expenses` (§3.9).
+ * Files a claim against `expenses` (§3.9), or edits one already filed.
  *
  * `status` and `submitted_by` are not on the form: the insert policy (§5.8)
  * requires `submitted_by = auth.uid()`, and a claim always starts pending. A
- * field for either would only offer the user a way to be rejected.
+ * field for either would only offer the user a way to be rejected. Status
+ * changes are their own action, in the row's actions dialog.
+ *
+ * Pass `expenseId` to edit instead of create. The row is refetched on open
+ * rather than taken from the table, because the table holds formatted display
+ * strings and a form needs the numbers back.
  */
+const props = defineProps({
+  expenseId: { type: String, default: '' },
+})
+
 const open = defineModel('open', { type: Boolean, default: false })
-const emit = defineEmits(['created'])
+const emit = defineEmits(['created', 'updated'])
+
+const isEdit = computed(() => Boolean(props.expenseId))
 
 const { user } = useAuth()
 const { ensureOrganization, organization, role } = useOrganization()
@@ -51,6 +64,7 @@ const form = reactive({
 const categories = ref([])
 const accounts = ref([])
 const receipt = ref(null)
+const loading = ref(false)
 const showNewCategory = ref(false)
 const fieldErrors = reactive({ vendor: '', amount: '', spentOn: '', accountId: '' })
 
@@ -60,8 +74,12 @@ const currency = computed(() => organization.value?.base_currency ?? 'GHS')
  * Recording the bank side writes to `transactions`, which only bookkeepers and
  * up may do. Offering the option to someone RLS will reject would fail the
  * whole save for no reason they could act on.
+ *
+ * It is offered on new claims only. An edit would have no way to tell whether
+ * the bank line already exists, and recording a second one would double-count
+ * the money leaving the account.
  */
-const canRecordPayment = computed(() => canWrite(role.value))
+const canRecordPayment = computed(() => canWrite(role.value) && !isEdit.value)
 
 // A reimbursable claim was paid out of someone's own pocket — no company bank
 // line exists for it until the repayment, which is its own transaction.
@@ -88,7 +106,24 @@ async function loadReferenceData() {
   accounts.value = loadedAccounts
 }
 
-watch(open, (isOpen) => {
+/** Fill the form from the stored row, undoing the display formatting. */
+async function loadExpense() {
+  const row = await getExpense(props.expenseId)
+  Object.assign(form, {
+    vendor: row.vendor ?? '',
+    amount: String(row.amount ?? ''),
+    spentOn: row.spent_on ?? today(),
+    categoryId: row.category_id ?? '',
+    accountId: row.account_id ?? '',
+    method: row.method ?? 'card',
+    methodDetail: row.method_detail ?? '',
+    reimbursable: row.reimbursable ?? false,
+    recordPayment: false,
+    notes: row.notes ?? '',
+  })
+}
+
+watch(open, async (isOpen) => {
   if (!isOpen) return
 
   Object.assign(form, {
@@ -108,9 +143,14 @@ watch(open, (isOpen) => {
   reset()
 
   // Errors here surface through the same banner as a failed save.
-  loadReferenceData().catch((caught) => {
+  loading.value = true
+  try {
+    await Promise.all([loadReferenceData(), isEdit.value ? loadExpense() : null])
+  } catch (caught) {
     error.value = caught
-  })
+  } finally {
+    loading.value = false
+  }
 })
 
 function onCategoryCreated(category) {
@@ -145,7 +185,7 @@ function validate() {
 async function onSubmit() {
   if (!validate()) return
 
-  const created = await submit(async () => {
+  const saved = await submit(async () => {
     const orgId = await ensureOrganization()
     const payload = {
       vendor: form.vendor.trim(),
@@ -160,6 +200,12 @@ async function onSubmit() {
       notes: form.notes.trim() || null,
     }
 
+    if (isEdit.value) {
+      const expense = await updateExpense(props.expenseId, payload)
+      if (receipt.value) await uploadReceipt(orgId, props.expenseId, receipt.value)
+      return expense
+    }
+
     const expense = willRecordPayment.value
       ? await createExpenseWithPayment(orgId, user.value.id, payload)
       : await createExpense(orgId, user.value.id, payload)
@@ -171,9 +217,9 @@ async function onSubmit() {
     return expense
   })
 
-  if (created) {
+  if (saved) {
     open.value = false
-    emit('created', created)
+    emit(isEdit.value ? 'updated' : 'created', saved)
   }
 }
 </script>
@@ -181,8 +227,12 @@ async function onSubmit() {
 <template>
   <BaseModal
     v-model:open="open"
-    title="Record expense"
-    subtitle="Files a claim for approval. It stays pending until someone signs it off."
+    :title="isEdit ? 'Edit expense' : 'Record expense'"
+    :subtitle="
+      isEdit
+        ? 'Correcting the details here does not change the claim’s status.'
+        : 'Files a claim for approval. It stays pending until someone signs it off.'
+    "
     size="lg"
     :busy="submitting"
   >
@@ -268,7 +318,9 @@ async function onSubmit() {
             @change="onFileChange"
           />
         </label>
-        <p class="mt-1.5 text-xs text-slate-500">Optional — you can add it later.</p>
+        <p class="mt-1.5 text-xs text-slate-500">
+          {{ isEdit ? 'Attaching one here replaces the receipt on file.' : 'Optional — you can add it later.' }}
+        </p>
       </div>
 
       <div class="sm:col-span-2">
@@ -343,10 +395,11 @@ async function onSubmit() {
       <button
         type="submit"
         form="record-expense-form"
-        :disabled="submitting"
+        :disabled="submitting || loading"
         class="rounded-xl bg-brand-600 px-5 py-2.5 text-sm font-semibold text-white shadow-md shadow-brand-600/20 transition hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
       >
-        {{ submitting ? 'Recording…' : 'Record expense' }}
+        <template v-if="isEdit">{{ submitting ? 'Saving…' : 'Save changes' }}</template>
+        <template v-else>{{ submitting ? 'Recording…' : 'Record expense' }}</template>
       </button>
     </template>
   </BaseModal>

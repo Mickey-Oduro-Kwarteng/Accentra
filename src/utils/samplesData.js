@@ -37,8 +37,15 @@ export const navItems = [
 
 // These labels are mapped to database enum values inside each service.
 export const cashFlowRanges = ['3M', '6M', '12M']
-export const invoiceFilters = ['All', 'Draft', 'Sent', 'Paid', 'Overdue']
-export const expenseFilters = ['All', 'Approved', 'Pending', 'Reimbursable']
+export const invoiceFilters = ['All', 'Draft', 'Sent', 'Paid', 'Overdue', 'Cancelled']
+export const expenseFilters = [
+  'All',
+  'Pending',
+  'Approved',
+  'Rejected',
+  'Reimbursed',
+  'Reimbursable',
+]
 export const transactionFilters = ['All', 'Money in', 'Money out', 'Uncategorised']
 export const reportPeriods = ['This month', 'This quarter', 'Year to date']
 

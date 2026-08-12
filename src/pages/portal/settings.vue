@@ -1,5 +1,5 @@
 <script setup>
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import ConfirmDialog from '../../components/modals/ConfirmDialog.vue'
 import UploadAvatarModal from '../../components/modals/UploadAvatarModal.vue'
 import AsyncState from '../../components/portal/AsyncState.vue'
@@ -9,6 +9,7 @@ import FormField from '../../components/ui/FormField.vue'
 import { useAuth } from '../../composables/useAuth'
 import { useOrganization } from '../../composables/useOrganization'
 import { usePortalData } from '../../composables/usePortalData'
+import { useProfile } from '../../composables/useProfile'
 import {
   getSettingsPageData,
   removeAvatar,
@@ -21,9 +22,13 @@ import { notificationPrefs, settingsTabs } from '../../utils/samplesData'
 
 const { user } = useAuth()
 const { ensureOrganization } = useOrganization()
+// The topbar renders from this same record, so every write below has to reach
+// it — otherwise the photo changes here and nowhere else until a reload.
+const { profile: sharedProfile, refreshProfile, setProfile } = useProfile()
 
 const activeTab = ref('profile')
 const email = computed(() => user.value?.email ?? '')
+const avatarUrl = computed(() => sharedProfile.value?.avatarUrl ?? '')
 
 const { data, loading, error, refresh } = usePortalData((orgId) =>
   getSettingsPageData(orgId, user.value.id),
@@ -37,7 +42,12 @@ const prefs = reactive({})
 
 watch(data, (loaded) => {
   if (!loaded) return
-  Object.assign(profile, loaded.profile)
+  // Only the three editable fields — the avatar is not on this form, and
+  // copying it in would let a stale URL ride along on the next save.
+  profile.fullName = loaded.profile.fullName
+  profile.jobTitle = loaded.profile.jobTitle
+  profile.phone = loaded.profile.phone
+  setProfile(loaded.profile)
   Object.assign(company, loaded.company.form)
   // Default to off for any key with no row yet.
   notificationPrefs.forEach((pref) => {
@@ -52,10 +62,36 @@ const savedMessage = ref('')
 const showUploadAvatar = ref(false)
 const showRemoveAvatar = ref(false)
 
-function onAvatarChanged(message) {
+/**
+ * Confirmation is worth seeing and not worth keeping. Left on screen it becomes
+ * furniture, and the next save has nothing new to show. The timer is cleared
+ * first so a second save restarts the four seconds rather than inheriting what
+ * was left of the first.
+ */
+const SAVED_MESSAGE_MS = 4000
+let savedTimer = null
+
+function flashSaved(message) {
   saveError.value = null
   savedMessage.value = message
-  refresh()
+  clearTimeout(savedTimer)
+  savedTimer = setTimeout(() => {
+    savedMessage.value = ''
+  }, SAVED_MESSAGE_MS)
+}
+
+onBeforeUnmount(() => clearTimeout(savedTimer))
+
+/**
+ * Refetch the profile, not the whole page: the upload wrote the new URL itself,
+ * so neither this page nor the topbar is holding it. Nothing else on the page
+ * reads that row, and the form fields the page did fetch have not changed.
+ */
+function onAvatarChanged(message) {
+  flashSaved(message)
+  refreshProfile(user.value.id).catch((caught) => {
+    saveError.value = caught
+  })
 }
 
 async function saveProfile() {
@@ -63,7 +99,12 @@ async function saveProfile() {
   saveError.value = null
   try {
     await updateProfile(user.value.id, profile)
-    savedMessage.value = 'Profile saved'
+    setProfile({
+      fullName: profile.fullName,
+      jobTitle: profile.jobTitle,
+      phone: profile.phone,
+    })
+    flashSaved('Profile saved')
   } catch (caught) {
     saveError.value = caught
   } finally {
@@ -77,7 +118,7 @@ async function saveCompany() {
   try {
     const orgId = await ensureOrganization()
     await updateCompanySettings(orgId, company)
-    savedMessage.value = 'Company details saved'
+    flashSaved('Company details saved')
   } catch (caught) {
     saveError.value = caught
   } finally {
@@ -169,8 +210,8 @@ async function toggleChannel(key, channel) {
 
               <div class="mt-6 flex flex-wrap items-center gap-5 border-b border-slate-100 pb-6">
                 <img
-                  v-if="data?.profile?.avatarUrl"
-                  :src="data.profile.avatarUrl"
+                  v-if="avatarUrl"
+                  :src="avatarUrl"
                   alt="Your profile photo"
                   class="size-16 rounded-2xl object-cover"
                 />
@@ -190,7 +231,7 @@ async function toggleChannel(key, channel) {
                   </button>
                   <button
                     type="button"
-                    :disabled="!data?.profile?.avatarUrl"
+                    :disabled="!avatarUrl"
                     class="rounded-xl px-4 py-2.5 text-sm font-semibold text-slate-500 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
                     @click="showRemoveAvatar = true"
                   >

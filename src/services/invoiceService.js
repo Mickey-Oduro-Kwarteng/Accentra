@@ -1,6 +1,8 @@
 import { supabase } from '../lib/supabaseClient'
 import { formatCurrency, formatDate, formatStatus } from '../utils/format'
 import { escapeFilterValue, pageRange, unwrap, unwrapWithCount } from './helpers'
+import { formatPaymentMethod } from './paymentMethods'
+import { createTransaction, deleteTransaction } from './transactionService'
 
 /** Queries behind /portal/invoices. */
 
@@ -10,6 +12,19 @@ const STATUS_BY_LABEL = {
   Sent: 'sent',
   Paid: 'paid',
   Overdue: 'overdue',
+  Cancelled: 'void',
+}
+
+/**
+ * Display label per status. Only `void` needs one: the enum says "void" because
+ * that is the accounting word, but every button in the UI offers to *cancel* an
+ * invoice, and a table that then labels the result "Void" reads as a different
+ * outcome from the one that was chosen.
+ */
+const STATUS_LABELS = { void: 'Cancelled' }
+
+function invoiceStatusLabel(status) {
+  return STATUS_LABELS[status] ?? formatStatus(status)
 }
 
 export async function getInvoiceStats(organizationId) {
@@ -47,7 +62,7 @@ export async function listInvoices(organizationId, {
   let query = supabase
     .from('invoices')
     .select(
-      'id, number, status, issue_date, due_date, total, balance_due, clients!inner(id, name, email)',
+      'id, number, status, issue_date, due_date, total, amount_paid, balance_due, payment_method, clients!inner(id, name, email)',
       { count: 'exact' },
     )
     .eq('organization_id', organizationId)
@@ -74,7 +89,7 @@ export async function listInvoices(organizationId, {
       await supabase
         .from('invoices')
         .select(
-          'id, number, status, issue_date, due_date, total, balance_due, clients!inner(id, name, email)',
+          'id, number, status, issue_date, due_date, total, amount_paid, balance_due, payment_method, clients!inner(id, name, email)',
           { count: 'exact' },
         )
         .eq('organization_id', organizationId)
@@ -100,7 +115,17 @@ function toInvoiceRow(row) {
     due: formatDate(row.due_date),
     amount: formatCurrency(row.total, { decimals: true }),
     balanceDue: formatCurrency(row.balance_due, { decimals: true }),
-    status: formatStatus(row.status),
+    status: invoiceStatusLabel(row.status),
+    // The raw enum as well. Deciding what a row may do from the *label* would
+    // break the moment a label changed — as "Void" → "Cancelled" just did.
+    statusValue: row.status,
+    // Both forms: the label for the table, the raw enum for the payment dialog
+    // to preselect from.
+    paymentMethod: formatPaymentMethod(row.payment_method),
+    paymentMethodValue: row.payment_method ?? '',
+    // Raw, because what the row actions need to know is whether any money has
+    // landed at all — a formatted "₵0.00" cannot answer that.
+    amountPaid: Number(row.amount_paid ?? 0),
   }
 }
 
@@ -136,6 +161,7 @@ export async function createInvoice(organizationId, {
   notes,
   currency = 'GHS',
   status = 'draft',
+  paymentMethod = null,
   createdBy = null,
   lines = [],
 }) {
@@ -151,6 +177,9 @@ export async function createInvoice(organizationId, {
         notes: notes || null,
         currency,
         status,
+        // How the client is asked to pay. Empty means the invoice does not say,
+        // which is a real answer and not the same as any particular method.
+        payment_method: paymentMethod || null,
         // Raising an invoice straight to "sent" still has to stamp the date the
         // overdue job (§6.5) and the stats RPC read from.
         sent_at: status === 'sent' ? new Date().toISOString() : null,
@@ -179,6 +208,99 @@ export async function createInvoice(organizationId, {
   }
 
   return invoice
+}
+
+/**
+ * Edit an invoice that has not been settled or part-paid.
+ *
+ * The caller is responsible for not offering this on a paid invoice — see
+ * `isInvoiceEditable`. It matters beyond tidiness: the lines are replaced
+ * wholesale, and `invoices_paid_within_total` would reject the moment the
+ * recalculated total dropped below what had already been received.
+ *
+ * The new lines go in *before* the old ones come out. Both orders have a
+ * failure mode, and this is the survivable one: a failure part-way leaves the
+ * original lines intact with duplicates beside them, which is visible and
+ * fixable. Deleting first and failing on the insert would leave an invoice with
+ * no lines and a total of zero.
+ *
+ * Totals are never sent. The `invoice_items_recalc` trigger (§6.2) fires on
+ * insert *and* delete and recomputes from whatever rows remain, so it settles
+ * on the right figure once the swap is done.
+ */
+export async function updateInvoice(invoiceId, {
+  clientId,
+  number,
+  issueDate,
+  dueDate,
+  notes,
+  paymentMethod = null,
+  status = null,
+  stampSent = false,
+  lines = null,
+}) {
+  const patch = {
+    client_id: clientId,
+    number,
+    issue_date: issueDate,
+    due_date: dueDate,
+    notes: notes || null,
+    payment_method: paymentMethod || null,
+  }
+
+  if (status) patch.status = status
+  // Only a genuine draft → sent transition stamps the date. Pushing an overdue
+  // invoice back to sent is a correction, not a re-send, and re-stamping it
+  // would quietly shorten every "days to pay" figure that reads from it.
+  if (stampSent) patch.sent_at = new Date().toISOString()
+
+  const invoice = unwrap(
+    await supabase.from('invoices').update(patch).eq('id', invoiceId).select().single(),
+    'invoice update',
+  )
+
+  // `null` means "leave the lines alone"; an empty array would mean "remove
+  // them all", which is a different instruction.
+  if (lines) {
+    const existing =
+      unwrap(
+        await supabase.from('invoice_items').select('id').eq('invoice_id', invoiceId),
+        'invoice line lookup',
+      ) ?? []
+
+    await addInvoiceItems(invoiceId, lines)
+
+    if (existing.length) {
+      unwrap(
+        await supabase
+          .from('invoice_items')
+          .delete()
+          .in(
+            'id',
+            existing.map((row) => row.id),
+          ),
+        'invoice line replacement',
+      )
+    }
+  }
+
+  return invoice
+}
+
+/**
+ * Whether an invoice may still be edited, voided or deleted.
+ *
+ * Two separate reasons to say no. A paid or voided invoice is a record of
+ * something that happened, and records do not get rewritten. A part-paid one is
+ * still open, but money has already been received against these figures —
+ * changing them would leave the payment describing an invoice that no longer
+ * exists.
+ */
+export function isInvoiceEditable(invoice) {
+  if (!invoice) return false
+  const status = invoice.statusValue ?? String(invoice.status ?? '').toLowerCase()
+  if (status === 'paid' || status === 'void') return false
+  return Number(invoice.amountPaid ?? 0) <= 0
 }
 
 /**
@@ -218,17 +340,104 @@ export async function updateInvoiceStatus(invoiceId, status) {
   )
 }
 
-/** Record a payment. `amount_paid` drives the generated `balance_due` column. */
-export async function recordInvoicePayment(invoiceId, amountPaid, { markPaid = true } = {}) {
+/**
+ * A `date` input gives a day, `paid_at` wants an instant.
+ *
+ * Today keeps the real clock time. Any other day lands at midday, so no
+ * timezone offset can shift a payment onto the day before the one that was
+ * picked — which is exactly the kind of error that only shows up in a month-end
+ * report.
+ */
+function dayToTimestamp(day) {
+  if (!day) return new Date().toISOString()
+  const today = new Date().toISOString().slice(0, 10)
+  if (day === today) return new Date().toISOString()
+  return new Date(`${day}T12:00:00`).toISOString()
+}
+
+/**
+ * Record a payment. `amount_paid` drives the generated `balance_due` column.
+ *
+ * `paidOn` is the day the money actually arrived, which is not always today —
+ * payments get entered late, and the date on the record should be the one that
+ * happened.
+ *
+ * `method` overwrites the one chosen when the invoice was raised. That field
+ * starts out as how the client was *asked* to pay and ends up as how they
+ * actually did, because once the money is in, the second is the only one worth
+ * keeping.
+ */
+export async function recordInvoicePayment(
+  invoiceId,
+  amountPaid,
+  { markPaid = true, paidOn = null, method = null } = {},
+) {
   const patch = { amount_paid: amountPaid }
   if (markPaid) {
     patch.status = 'paid'
-    patch.paid_at = new Date().toISOString()
+    patch.paid_at = dayToTimestamp(paidOn)
   }
+  if (method) patch.payment_method = method
+
   return unwrap(
     await supabase.from('invoices').update(patch).eq('id', invoiceId).select().single(),
     'payment record',
   )
+}
+
+/**
+ * Record a payment *and* the money arriving in an account, linked.
+ *
+ * `transactions.invoice_id` is the seam: the invoice says what is owed, the
+ * transaction says the cash turned up, and pointing one at the other is what
+ * stops the two being independent guesses at the same event. A bank line that
+ * does not say how the money came in is half a record, so the method goes on
+ * both — the invoice keeps the fact, the transaction keeps it in the ledger.
+ *
+ * The transaction is written first. If the invoice update then fails it is
+ * removed again, because a bank line for a payment the invoice never recorded
+ * would overstate the account and understate what is still owed.
+ */
+export async function recordInvoicePaymentWithTransaction(
+  organizationId,
+  invoiceId,
+  amountPaid,
+  {
+    markPaid = true,
+    paidOn = null,
+    method = null,
+    payment,
+    accountId,
+    methodLabel = '',
+    invoiceNumber = '',
+    currency = 'GHS',
+  },
+) {
+  const created = await createTransaction(organizationId, {
+    accountId,
+    invoiceId,
+    occurredOn: paidOn,
+    description: methodLabel
+      ? `Payment received — ${invoiceNumber} (${methodLabel})`
+      : `Payment received — ${invoiceNumber}`,
+    // Money in is positive — the sign is what makes `sum(amount)` mean anything.
+    amount: Math.abs(Number(payment)),
+    currency,
+    status: 'cleared',
+  })
+
+  try {
+    return await recordInvoicePayment(invoiceId, amountPaid, { markPaid, paidOn, method })
+  } catch (caught) {
+    try {
+      await deleteTransaction(created.id)
+    } catch {
+      throw new Error(
+        `The bank transaction was recorded, but the invoice could not be updated (${caught.message}). Remove that transaction from the transactions page, or the account balance will be wrong.`,
+      )
+    }
+    throw caught
+  }
 }
 
 export async function deleteInvoice(invoiceId) {

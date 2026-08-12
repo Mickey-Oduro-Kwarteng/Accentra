@@ -113,6 +113,7 @@ const EXPORT_COLUMNS = [
   { key: 'issued', label: 'Issued' },
   { key: 'due', label: 'Due' },
   { key: 'status', label: 'Status' },
+  { key: 'paymentMethod', label: 'Payment method' },
   { key: 'amount', label: 'Amount' },
   { key: 'balanceDue', label: 'Balance due' },
 ]
@@ -237,8 +238,9 @@ function onInvoiceChanged() {
                     </span>
                   </div>
                 </td>
-                <td class="px-6 py-4 text-sm font-medium whitespace-nowrap text-slate-600">
-                  {{ invoice.number }}
+                <td class="px-6 py-4 whitespace-nowrap">
+                  <span class="block text-sm font-medium text-slate-600">{{ invoice.number }}</span>
+                  <span class="block text-xs text-slate-400">{{ invoice.paymentMethod }}</span>
                 </td>
                 <td class="px-6 py-4 text-sm whitespace-nowrap text-slate-500">{{ invoice.issued }}</td>
                 <td class="px-6 py-4 text-sm whitespace-nowrap text-slate-500">{{ invoice.due }}</td>

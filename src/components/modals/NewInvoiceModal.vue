@@ -11,21 +11,34 @@ import { useFormSubmit } from '../../composables/useFormSubmit'
 import { useOrganization } from '../../composables/useOrganization'
 import {
   createInvoice,
+  getInvoice,
   getNextInvoiceNumber,
   listClients,
+  updateInvoice,
 } from '../../services/invoiceService'
+import { INVOICE_PAYMENT_METHODS } from '../../services/paymentMethods'
 import { formatCurrency } from '../../utils/format'
 
 /**
- * Raises an invoice (§3.6) and its lines (§3.7).
+ * Raises an invoice (§3.6) and its lines (§3.7), or edits one still open.
  *
  * The totals shown here are a preview only — nothing computed in this file is
  * sent. `recalc_invoice_totals` (§6.2) fires on the line insert and writes
  * subtotal, tax and total itself, so there is exactly one place the arithmetic
  * can be wrong, and it is not this one.
+ *
+ * Pass `invoiceId` to edit. Whether an invoice *may* be edited is decided by
+ * `isInvoiceEditable` where the actions are offered — by the time this opens,
+ * that question has been answered.
  */
+const props = defineProps({
+  invoiceId: { type: String, default: '' },
+})
+
 const open = defineModel('open', { type: Boolean, default: false })
-const emit = defineEmits(['created'])
+const emit = defineEmits(['created', 'updated'])
+
+const isEdit = computed(() => Boolean(props.invoiceId))
 
 const { user } = useAuth()
 const { ensureOrganization, organization } = useOrganization()
@@ -47,11 +60,20 @@ const form = reactive({
   number: '',
   issueDate: today(),
   dueDate: '',
+  // Bank transfer is what most invoices ask for; anything else is a deliberate
+  // choice, and "not specified" stays available for the ones that do not say.
+  paymentMethod: 'bank_transfer',
   notes: '',
 })
 
 const lines = ref([emptyLine()])
 const clients = ref([])
+const clientsLoading = ref(false)
+const clientsError = ref(null)
+const loading = ref(false)
+// Drives the footer: a draft can still be sent from here, an invoice already
+// sent has nowhere further to go.
+const currentStatus = ref('draft')
 const showNewClient = ref(false)
 const fieldErrors = reactive({ clientId: '', number: '', dueDate: '', lines: '' })
 
@@ -61,13 +83,42 @@ const clientOptions = computed(() =>
   clients.value.map((row) => ({ value: row.id, label: row.name })),
 )
 
+/**
+ * An empty dropdown means nothing on its own — no clients yet and a failed
+ * lookup look identical in a `<select>`. Say which, on the field itself.
+ */
+const clientPlaceholder = computed(() => {
+  if (clientsLoading.value) return 'Loading clients…'
+  if (clientsError.value) return 'Could not load clients'
+  if (!clientOptions.value.length) return 'No clients yet'
+  return 'Choose a client'
+})
+
+const clientHint = computed(() => {
+  if (fieldErrors.clientId || clientsError.value) return ''
+  if (clientsLoading.value) return 'Loading your clients…'
+  if (!clientOptions.value.length) return 'Add one with New client above.'
+  return ''
+})
+
+/**
+ * Quantities are whole units. The column is `numeric(12,3)` so fractions would
+ * store, but nothing here is sold by the third of a unit, and a stray decimal
+ * only ever showed up as a total nobody could reproduce. One place decides, and
+ * the preview, the save and the input step all read from it.
+ */
+function quantityOf(line) {
+  const value = Math.trunc(Number(line.quantity))
+  return Number.isFinite(value) && value > 0 ? value : 1
+}
+
 /* Preview of what the trigger will write, so nobody has to save to see it. */
 const totals = computed(() => {
   let subtotal = 0
   let tax = 0
 
   for (const line of lines.value) {
-    const lineTotal = (Number(line.quantity) || 0) * (Number(line.unitPrice) || 0)
+    const lineTotal = quantityOf(line) * (Number(line.unitPrice) || 0)
     subtotal += lineTotal
     tax += (lineTotal * (Number(line.taxRate) || 0)) / 100
   }
@@ -79,17 +130,78 @@ const hasUsableLine = computed(() =>
   lines.value.some((line) => line.description.trim() && Number(line.unitPrice) > 0),
 )
 
+/**
+ * The client list and the next invoice number are independent lookups, and are
+ * loaded independently on purpose. Sharing one `Promise.all` meant a failure
+ * numbering the invoice — a convenience — rejected before the clients were
+ * assigned, and the only symptom was an empty client dropdown.
+ */
 async function loadReferenceData() {
   const orgId = await ensureOrganization()
-  const [loadedClients, nextNumber] = await Promise.all([
-    listClients(orgId),
-    getNextInvoiceNumber(orgId),
-  ])
-  clients.value = loadedClients
-  form.number = nextNumber
+
+  clientsLoading.value = true
+  clientsError.value = null
+
+  const loadClients = listClients(orgId)
+    .then((rows) => {
+      clients.value = rows
+    })
+    .catch((caught) => {
+      clientsError.value = caught
+      clients.value = []
+    })
+    .finally(() => {
+      clientsLoading.value = false
+    })
+
+  // A number that could not be prefilled is typed by hand, so this failure is
+  // not worth stopping the form for. On an edit there is nothing to prefill —
+  // the invoice already has its number.
+  const loadNumber = isEdit.value
+    ? Promise.resolve()
+    : getNextInvoiceNumber(orgId)
+        .then((next) => {
+          form.number = next
+        })
+        .catch(() => {})
+
+  await Promise.all([loadClients, loadNumber])
 }
 
-watch(open, (isOpen) => {
+/** Fill the form from the stored invoice, lines and all. */
+async function loadInvoice() {
+  const row = await getInvoice(props.invoiceId)
+
+  currentStatus.value = row.status ?? 'draft'
+
+  Object.assign(form, {
+    clientId: row.client_id ?? '',
+    number: row.number ?? '',
+    issueDate: row.issue_date ?? today(),
+    dueDate: row.due_date ?? '',
+    paymentMethod: row.payment_method ?? '',
+    notes: row.notes ?? '',
+  })
+
+  // The due date came from the record, so the terms watcher must not treat it
+  // as its own to overwrite.
+  autoFilled = ''
+
+  const items = [...(row.invoice_items ?? [])].sort(
+    (a, b) => (a.position ?? 0) - (b.position ?? 0),
+  )
+  lines.value = items.length
+    ? items.map((item) => ({
+        description: item.description ?? '',
+        quantity: Number(item.quantity) || 1,
+        unitPrice: String(item.unit_price ?? ''),
+        taxRate: Number(item.tax_rate) || 0,
+        stream: item.stream ?? '',
+      }))
+    : [emptyLine()]
+}
+
+watch(open, async (isOpen) => {
   if (!isOpen) return
 
   Object.assign(form, {
@@ -97,16 +209,28 @@ watch(open, (isOpen) => {
     number: '',
     issueDate: today(),
     dueDate: '',
+    paymentMethod: 'bank_transfer',
     notes: '',
   })
   Object.assign(fieldErrors, { clientId: '', number: '', dueDate: '', lines: '' })
   lines.value = [emptyLine()]
+  clients.value = []
+  clientsError.value = null
+  currentStatus.value = 'draft'
   autoFilled = ''
   reset()
 
-  loadReferenceData().catch((caught) => {
+  loading.value = true
+  try {
+    // The clients have to be in place before the invoice fills the field, or
+    // the select would hold an id with no option to match it.
+    await loadReferenceData()
+    if (isEdit.value) await loadInvoice()
+  } catch (caught) {
     error.value = caught
-  })
+  } finally {
+    loading.value = false
+  }
 })
 
 /**
@@ -136,6 +260,8 @@ watch(
 
 function onClientCreated(client) {
   clients.value = [...clients.value, client].sort((a, b) => a.name.localeCompare(b.name))
+  // The list clearly reads now, whatever went wrong loading it a moment ago.
+  clientsError.value = null
   form.clientId = client.id
 }
 
@@ -149,7 +275,12 @@ function removeLine(index) {
 }
 
 function lineTotal(line) {
-  return (Number(line.quantity) || 0) * (Number(line.unitPrice) || 0)
+  return quantityOf(line) * (Number(line.unitPrice) || 0)
+}
+
+/** Snap what was typed to the whole number that will actually be charged. */
+function normaliseQuantity(line) {
+  line.quantity = quantityOf(line)
 }
 
 function validate() {
@@ -173,34 +304,65 @@ function validate() {
   return !Object.values(fieldErrors).some(Boolean)
 }
 
+function payloadLines() {
+  return lines.value
+    .filter((line) => line.description.trim())
+    .map((line) => ({
+      description: line.description.trim(),
+      quantity: quantityOf(line),
+      unitPrice: Number(line.unitPrice) || 0,
+      taxRate: Number(line.taxRate) || 0,
+      stream: line.stream.trim(),
+    }))
+}
+
+/**
+ * `status` is what to move the invoice to, or null to leave it where it is.
+ * Editing an invoice does not change its status by itself — that is what the
+ * "Save and mark sent" button is for, and only a draft has anywhere to go.
+ */
 async function save(status) {
   if (!validate()) return
 
-  const created = await submit(async () =>
-    createInvoice(await ensureOrganization(), {
+  const saved = await submit(async () => {
+    const common = {
       clientId: form.clientId,
       number: form.number.trim(),
       issueDate: form.issueDate,
       dueDate: form.dueDate,
       notes: form.notes.trim(),
-      currency: currency.value,
-      status,
-      createdBy: user.value?.id ?? null,
-      lines: lines.value
-        .filter((line) => line.description.trim())
-        .map((line) => ({
-          description: line.description.trim(),
-          quantity: Number(line.quantity) || 1,
-          unitPrice: Number(line.unitPrice) || 0,
-          taxRate: Number(line.taxRate) || 0,
-          stream: line.stream.trim(),
-        })),
-    }),
-  )
+      paymentMethod: form.paymentMethod,
+      lines: payloadLines(),
+    }
 
-  if (created) {
+    if (isEdit.value) {
+      // A due date pushed into the future un-overdues an invoice. Leaving it
+      // late would have the overdue job (§6.5) flip it straight back anyway,
+      // and the invoice would keep claiming to be late after the date it was
+      // late against had been corrected.
+      const unOverdue =
+        currentStatus.value === 'overdue' && form.dueDate >= today() ? 'sent' : null
+
+      return updateInvoice(props.invoiceId, {
+        ...common,
+        status: status ?? unOverdue,
+        // Only the button says "send". The un-overdue correction reuses the
+        // same status without pretending the invoice went out again today.
+        stampSent: status === 'sent',
+      })
+    }
+
+    return createInvoice(await ensureOrganization(), {
+      ...common,
+      currency: currency.value,
+      status: status ?? 'draft',
+      createdBy: user.value?.id ?? null,
+    })
+  })
+
+  if (saved) {
     open.value = false
-    emit('created', created)
+    emit(isEdit.value ? 'updated' : 'created', saved)
   }
 }
 </script>
@@ -208,20 +370,21 @@ async function save(status) {
 <template>
   <BaseModal
     v-model:open="open"
-    title="New invoice"
+    :title="isEdit ? 'Edit invoice' : 'New invoice'"
     subtitle="Totals are calculated by the database from the lines below."
     size="xl"
     :busy="submitting"
   >
-    <form id="new-invoice-form" class="space-y-6" @submit.prevent="save('draft')">
+    <form id="new-invoice-form" class="space-y-6" @submit.prevent="save(null)">
       <div class="grid gap-5 sm:grid-cols-2">
         <SelectField
           v-model="form.clientId"
           label="Client"
-          placeholder="Choose a client"
+          :placeholder="clientPlaceholder"
           :options="clientOptions"
           required
-          :error="fieldErrors.clientId"
+          :error="fieldErrors.clientId || clientsError?.message || ''"
+          :hint="clientHint"
         >
           <template #action>
             <button
@@ -252,6 +415,14 @@ async function save(status) {
           required
           :error="fieldErrors.dueDate"
           :hint="fieldErrors.dueDate ? '' : 'Defaults to the client’s payment terms.'"
+        />
+
+        <SelectField
+          v-model="form.paymentMethod"
+          label="Payment method"
+          placeholder="Not specified"
+          :options="INVOICE_PAYMENT_METHODS"
+          hint="How you are asking to be paid. Recording the payment updates it to how they actually paid."
         />
       </div>
 
@@ -297,10 +468,12 @@ async function save(status) {
                   <input
                     v-model="line.quantity"
                     type="number"
-                    min="0.001"
-                    step="0.001"
+                    min="1"
+                    step="1"
+                    inputmode="numeric"
                     :aria-label="`Line ${index + 1} quantity`"
                     class="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-ink tabular-nums transition focus:border-brand-500 focus:ring-2 focus:ring-brand-100 focus:outline-none"
+                    @blur="normaliseQuantity(line)"
                   />
                 </td>
                 <td class="px-3 py-2">
@@ -398,17 +571,29 @@ async function save(status) {
       >
         Cancel
       </button>
+      <!--
+        An invoice already sent has nowhere further to go from here, so it gets
+        one button. A draft — new or being edited — keeps both.
+      -->
       <button
         type="submit"
         form="new-invoice-form"
-        :disabled="submitting"
-        class="rounded-xl border border-slate-200 bg-white px-5 py-2.5 text-sm font-semibold text-ink shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+        :disabled="submitting || loading"
+        class="rounded-xl px-5 py-2.5 text-sm font-semibold shadow-sm transition disabled:cursor-not-allowed disabled:opacity-60"
+        :class="
+          isEdit && currentStatus !== 'draft'
+            ? 'bg-brand-600 text-white shadow-md shadow-brand-600/20 hover:bg-brand-700'
+            : 'border border-slate-200 bg-white text-ink hover:bg-slate-50'
+        "
       >
-        {{ submitting ? 'Saving…' : 'Save as draft' }}
+        <template v-if="submitting">Saving…</template>
+        <template v-else-if="isEdit">Save changes</template>
+        <template v-else>Save as draft</template>
       </button>
       <button
+        v-if="!isEdit || currentStatus === 'draft'"
         type="button"
-        :disabled="submitting"
+        :disabled="submitting || loading"
         class="rounded-xl bg-brand-600 px-5 py-2.5 text-sm font-semibold text-white shadow-md shadow-brand-600/20 transition hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
         @click="save('sent')"
       >

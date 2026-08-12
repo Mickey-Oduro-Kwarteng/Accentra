@@ -1,7 +1,10 @@
 import { supabase } from '../lib/supabaseClient'
 import { formatCurrency, formatDate, formatStatus } from '../utils/format'
 import { escapeFilterValue, unwrap } from './helpers'
+import { formatPaymentMethod } from './paymentMethods'
 import { createTransaction, listLinkedExpenseIds } from './transactionService'
+
+export { PAYMENT_METHODS } from './paymentMethods'
 
 /** Queries behind /portal/expenses. */
 
@@ -56,6 +59,7 @@ export async function listExpenses(organizationId, { filter = 'All', search = ''
     .select(
       `
       id, vendor, spent_on, amount, method, method_detail, status, reimbursable, receipt_url,
+      submitted_by,
       expense_categories (id, name),
       profiles!expenses_submitted_by_fkey (id, full_name)
     `,
@@ -80,31 +84,36 @@ export async function listExpenses(organizationId, { filter = 'All', search = ''
     vendor: row.vendor,
     category: row.expense_categories?.name ?? 'Uncategorised',
     date: formatDate(row.spent_on),
-    method: row.method_detail || METHOD_LABELS[row.method] || formatStatus(row.method),
+    method: row.method_detail || formatPaymentMethod(row.method),
     amount: formatCurrency(row.amount, { decimals: true }),
     status: formatStatus(row.status),
+    // The raw enum too — the row actions decide what is offered from the value,
+    // not from the display label.
+    statusValue: row.status,
     owner: row.profiles?.full_name ?? 'Unknown',
+    submittedBy: row.submitted_by,
     reimbursable: row.reimbursable,
     receiptUrl: row.receipt_url,
   }))
 }
 
-const METHOD_LABELS = {
-  bank_transfer: 'Bank transfer',
-  card: 'Card',
-  cash: 'Cash',
-  mobile_money: 'Mobile money',
-  reimbursement: 'Reimbursement',
+/** One claim, unformatted, for the edit form to fill itself from. */
+export async function getExpense(expenseId) {
+  return unwrap(
+    await supabase
+      .from('expenses')
+      .select(
+        `
+        id, organization_id, category_id, account_id, vendor, spent_on, amount,
+        currency, method, method_detail, status, reimbursable, receipt_url, notes,
+        submitted_by
+      `,
+      )
+      .eq('id', expenseId)
+      .single(),
+    'expense lookup',
+  )
 }
-
-/** Payment methods, as the `payment_method` enum defines them. */
-export const PAYMENT_METHODS = [
-  { value: 'card', label: 'Card' },
-  { value: 'bank_transfer', label: 'Bank transfer' },
-  { value: 'mobile_money', label: 'Mobile money' },
-  { value: 'cash', label: 'Cash' },
-  { value: 'reimbursement', label: 'Reimbursement' },
-]
 
 export async function listExpenseCategories(organizationId) {
   return (
@@ -167,49 +176,52 @@ export async function createExpense(organizationId, userId, expense) {
   )
 }
 
-/** Approving requires a write role — RLS rejects it otherwise, no UI check needed. */
-export async function approveExpense(expenseId, approverId) {
+/** The `expense_status` enum, in the order a claim usually moves through it. */
+export const EXPENSE_STATUSES = [
+  { value: 'pending', label: 'Pending' },
+  { value: 'approved', label: 'Approved' },
+  { value: 'rejected', label: 'Rejected' },
+  { value: 'reimbursed', label: 'Reimbursed' },
+]
+
+/**
+ * Move a claim to any status, in either direction.
+ *
+ * A decision is not a one-way door — an expense approved by mistake has to be
+ * able to go back — so this is one function rather than a separate verb per
+ * transition. Sending a claim back to pending clears the decision stamped on
+ * it, otherwise the row would still name an approver for a claim nobody has
+ * approved.
+ *
+ * Requires a write role; RLS rejects it otherwise, so there is no UI check.
+ */
+export async function setExpenseStatus(expenseId, status, approverId = null) {
+  const patch = { status }
+
+  if (status === 'approved' || status === 'rejected') {
+    patch.approved_by = approverId
+    patch.approved_at = new Date().toISOString()
+  } else if (status === 'pending') {
+    patch.approved_by = null
+    patch.approved_at = null
+  }
+
   return unwrap(
-    await supabase
-      .from('expenses')
-      .update({
-        status: 'approved',
-        approved_by: approverId,
-        approved_at: new Date().toISOString(),
-      })
-      .eq('id', expenseId)
-      .select()
-      .single(),
-    'expense approval',
+    await supabase.from('expenses').update(patch).eq('id', expenseId).select().single(),
+    'expense status change',
   )
 }
 
-export async function rejectExpense(expenseId, approverId) {
-  return unwrap(
-    await supabase
-      .from('expenses')
-      .update({
-        status: 'rejected',
-        approved_by: approverId,
-        approved_at: new Date().toISOString(),
-      })
-      .eq('id', expenseId)
-      .select()
-      .single(),
-    'expense rejection',
-  )
+export function approveExpense(expenseId, approverId) {
+  return setExpenseStatus(expenseId, 'approved', approverId)
 }
 
-export async function markExpenseReimbursed(expenseId) {
-  return unwrap(
-    await supabase
-      .from('expenses')
-      .update({ status: 'reimbursed' })
-      .eq('id', expenseId)
-      .select()
-      .single(),
-    'reimbursement',
-  )
+export function rejectExpense(expenseId, approverId) {
+  return setExpenseStatus(expenseId, 'rejected', approverId)
+}
+
+export function markExpenseReimbursed(expenseId) {
+  return setExpenseStatus(expenseId, 'reimbursed')
 }
 
 /**

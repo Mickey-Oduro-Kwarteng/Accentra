@@ -42,6 +42,12 @@ function describe(error, context) {
   if (error.code === 'PGRST202' || error.code === '42883') {
     return `A database function used by this page does not exist yet. Run section 10 of supabase_schema.md.`
   }
+  // Column missing — the database was built from an older copy of the schema.
+  // Naming the column matters: the fix is a specific `alter table` in the doc,
+  // and "something is missing" would not tell anyone which one.
+  if (error.code === '42703') {
+    return `${error.message}. This database was built from an older copy of supabase_schema.md — run the matching "Already have a database…" block in it, then reload.`
+  }
   // RLS rejected the write.
   if (error.code === '42501' || error.code === 'PGRST301') {
     return `You do not have permission to do that.`
