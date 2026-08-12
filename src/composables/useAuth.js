@@ -39,11 +39,11 @@ export function useAuth() {
   init()
 
   async function signUp(email, password) {
-    return await supabase.auth.signUp({ email, password })
+    return await supabase.auth.signUp({ email: email.trim(), password })
   }
 
   async function signInWithPassword(email, password) {
-    return await supabase.auth.signInWithPassword({ email, password })
+    return await supabase.auth.signInWithPassword({ email: email.trim(), password })
   }
 
   async function signOut() {
