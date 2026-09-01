@@ -47,7 +47,7 @@ async function onSubmit() {
     :points="points"
   >
     <header class="mb-8">
-      <h1 class="text-3xl font-semibold tracking-tight text-ink">Sign in</h1>
+      <h1 class="text-3xl font-bold tracking-tight text-ink">Sign in</h1>
       <p class="mt-2 text-[15px] text-slate-500">
         New to Accentra?
         <RouterLink
